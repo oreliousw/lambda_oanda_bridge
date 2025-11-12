@@ -1,0 +1,9 @@
+# Ignore build artifacts and local backups
+package/
+*.zip
+*.tar.gz
+__pycache__/
+.env
+*.log
+lambda_backups/
+backups/

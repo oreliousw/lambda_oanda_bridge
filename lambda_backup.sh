@@ -39,6 +39,19 @@ done
 tar -czf ~/lambda_backups/lambda_backup_${DATE}.tar.gz -C ~/lambda_backups "$DATE"
 echo "🎉 All backups completed → ~/lambda_backups/lambda_backup_${DATE}.tar.gz"
 
-# Optional: upload tarball to S3
-S3_BUCKET="s3://o169-lambda-backups"
-aws s3 cp ~/lambda_backups/lambda_backup_${DATE}.tar.gz $S3_BUCKET/ || echo "⚠️ S3 upload skipped (bucket missing or perms)"
+#─────────────────────────────────────────────
+#  📦 Upload Backup to S3 (Glacier Deep Archive)
+#─────────────────────────────────────────────
+S3_BUCKET="s3://o169-lambda-backups"   # change to your bucket name
+ARCHIVE="$HOME/lambda_backups/lambda_backup_${DATE}.tar.gz"
+
+echo "☁️ Uploading backup to Glacier Deep Archive..."
+aws s3 cp "$ARCHIVE" "$S3_BUCKET/" \
+    --storage-class DEEP_ARCHIVE \
+    --region us-west-2
+
+if [ $? -eq 0 ]; then
+  echo "✅ Backup uploaded to Glacier Deep Archive successfully."
+else
+  echo "⚠️ Upload failed or bucket missing — check IAM permissions or bucket name."
+fi

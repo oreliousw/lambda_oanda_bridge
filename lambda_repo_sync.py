@@ -72,4 +72,18 @@ def lambda_handler(event, context):
         s3.put_object(
             Bucket=S3_BUCKET,
             Key=f"sync-logs/{marker}",
-            Body=("\n".j
+            Body=("\n".join(updated) or "No functions updated").encode("utf-8"),
+            StorageClass="STANDARD"
+        )
+
+        msg = f"✅ GitHub sync completed at {ts}\nUpdated Lambdas: {updated or 'none'}"
+        send_sns("Lambda Repo Sync Success", msg)
+        print(msg)
+
+        return {"statusCode": 200, "body": msg}
+
+    except Exception as e:
+        err = f"❌ Sync failed at {ts}\nError: {e}\nTrace:\n{traceback.format_exc()}"
+        send_sns("Lambda Repo Sync Failure", err)
+        print(err)
+        return {"statusCode": 500, "body": err}

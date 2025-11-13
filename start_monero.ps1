@@ -1,46 +1,48 @@
 #────────────────────────────────────────────
-#  start_monero.ps1 – Clean + Repaired Version
+#  start_monero_service.ps1 – Service Version
 #────────────────────────────────────────────
 
 $NodePath  = "D:\Monero\monerod.exe"
-$RPC_URL   = "http://127.0.0.1:18081/json_rpc"
+$Args      = "--non-interactive"
 $StartupLog = "D:\Monero\startup_log.txt"
+$RPC_URL   = "http://127.0.0.1:18081/json_rpc"
 
-Write-Host "Starting Monero Daemon..." -ForegroundColor Cyan
-Start-Process $NodePath -ArgumentList "--non-interactive" -WindowStyle Minimized
-Start-Sleep -Seconds 3
-
-function Test-RPC {
-    try {
-        $body = @{
-            jsonrpc = "2.0"
-            id      = "0"
-            method  = "get_info"
-        } | ConvertTo-Json
-
-        $resp = Invoke-RestMethod -Uri $RPC_URL -Method Post -Body $body -ContentType "application/json"
-
-        # Output
-        $msg = "[{0}] RPC OK - Height: {1} | Synced: {2}" -f (Get-Date), $resp.height, $resp.target_height
-        Add-Content -Path $StartupLog -Value $msg
-        Write-Host $msg -ForegroundColor Green
-        return $true
-    }
-    catch {
-        $msg = "[{0}] RPC ERROR - {1}" -f (Get-Date), $_.Exception.Message
-        Add-Content -Path $StartupLog -Value $msg
-        Write-Host $msg -ForegroundColor Red
-        return $false
-    }
+function Log($msg) {
+    $line = "[{0}] {1}" -f (Get-Date), $msg
+    Add-Content -Path $StartupLog -Value $line
+    Write-Host $line
 }
 
-Write-Host "Checking RPC availability..." -ForegroundColor Yellow
+Log "Starting Monero node (service mode)..."
 
-$attempts = 0
-while ($attempts -lt 20) {
-    if (Test-RPC) { break }
-    Start-Sleep -Seconds 2
-    $attempts++
+while ($true) {
+
+    # Launch monerod in the FOREGROUND so service stays alive
+    Log "Launching monerod..."
+    $process = Start-Process -FilePath $NodePath -ArgumentList $Args -NoNewWindow -PassThru
+
+    # Monitor loop
+    while (-not $process.HasExited) {
+        Start-Sleep -Seconds 10
+
+        # Optional — light RPC monitor
+        try {
+            $body = @{
+                jsonrpc = "2.0"
+                id      = "0"
+                method  = "get_info"
+            } | ConvertTo-Json
+
+            $resp = Invoke-RestMethod -Uri $RPC_URL -Method Post -Body $body -ContentType "application/json"
+
+            Log "RPC OK: Height=$($resp.height), Target=$($resp.target_height)"
+        }
+        catch {
+            Log "RPC ERROR: $($_.Exception.Message)"
+        }
+    }
+
+    # If monerod exits, log it & restart it
+    Log "monerod exited with code $($process.ExitCode). Restarting in 10 seconds..."
+    Start-Sleep -Seconds 10
 }
-
-Write-Host "Done. Check $StartupLog for status entries." -ForegroundColor Cyan

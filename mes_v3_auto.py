@@ -1,24 +1,20 @@
 #!/usr/bin/env python3
 """
-MES v3.0 – Pure Breakout / Continuation – CLI Auto-Trader + Backtester (OANDA-only, Python)
+MES v3.1 – Impulse Breakout / Continuation – CLI Auto-Trader + Backtester (OANDA-only, Python)
 
-Features
---------
-- Instruments: EUR/USD, GBP/USD, USD/CAD, USD/CHF, AUD/USD, NZD/USD
-- v3.0 core logic:
-    * Pure breakout / continuation engine (no pullback / mood / SSI entries)
-    * Break of recent structure (last 2 highs/lows on M15)
-    * 1H ATR expansion filter (ATR > previous ATR)
-    * Candle body >= 30% of 1H ATR
-    * EMA200 trend filter (1H + 4H must align for direction)
-    * SL at swing high/low, TP at 2.0R multiples
-- Backtest engine:
-    * Uses the same breakout rules on historical M15/H1/H4 data
-    * Reports win rate, avg R:R, pips, per-instrument stats
-- Environment:
-    * .env support via python-dotenv (project-local .env)
-    * OS/systemd environment variables
-    * Compatible with 1Password CLI: `op run -- python3 mes_v3_auto.py auto`
+Changes vs v3.0
+---------------
+- Removed: 1H ATR expansion filter (ATR_now > ATR_prev).
+- Added: 3-bar M15 impulse + acceleration filter:
+    * Last 3 M15 candles all bullish or all bearish.
+    * Total move over those 3 bars >= IMPULSE_MIN_PIPS.
+    * Average range of those 3 bars >= IMPULSE_MIN_AVG_RANGE_ATR_FACTOR * 1H ATR.
+- Kept:
+    * Break of recent structure (last 2 highs/lows on M15).
+    * Candle body >= 30% of 1H ATR (breakout strength).
+    * EMA200 trend filter (1H + 4H must align for direction).
+    * SL at swing high/low, TP at 2.0R multiples.
+    * Same risk sizing and bridge/Telegram plumbing.
 
 Usage
 -----
@@ -88,7 +84,7 @@ INSTRUMENTS = [
     "NZD_USD",
 ]
 
-# Risk config (kept from v2.1.1)
+# Risk config (kept from v2.1.1 / v3.0)
 RISK_PERCENT = 25.0
 MIN_DOLLAR_PER_PIP = 1.0
 MAX_UNITS_CLAMP = 15000
@@ -96,13 +92,18 @@ MAX_UNITS_CLAMP = 15000
 # ATR / signal filters
 MIN_ATR_PIPS = 8.0  # minimum 1H ATR in pips to consider setups
 
+# NEW: Impulse / acceleration filters (v3.1)
+IMPULSE_LOOKBACK = 3                     # last 3 × M15 bars (45 minutes)
+IMPULSE_MIN_PIPS = 10.0                  # minimum move over those 3 bars
+IMPULSE_MIN_AVG_RANGE_ATR_FACTOR = 0.4   # avg M15 range >= 40% of 1H ATR
+
 # Max open trades
 MAX_OPEN_TRADES = 3
 
 # Backtest defaults
 BACKTEST_DEFAULT_DAYS = 30
 
-# Breakout engine constants (from our design based on your charts)
+# Breakout engine constants
 BREAKOUT_BODY_ATR_FACTOR = 0.3  # body >= 30% of 1H ATR
 RR_TARGET = 2.0                  # fixed 2.0R target
 
@@ -288,16 +289,16 @@ def compute_breakout_for_last_bar(
     trend_down: pd.Series,
 ) -> MesSignal:
     """
-    Compute MES v3.0 breakout signal on the *latest* completed M15 bar.
+    Compute MES v3.1 breakout signal on the *latest* completed M15 bar.
     Used by live AUTO mode.
     """
     # Ensure sorted index and enough data
     m15 = m15.sort_index()
-    if len(m15) < 3:
+    if len(m15) < max(3, IMPULSE_LOOKBACK):
         last_close = float(m15["close"].iloc[-1])
         return MesSignal(
             instrument, "NONE", last_close, 0.0, 0.0, 0.0, 0.0, 0.0,
-            "Not enough M15 candles for breakout (need >=3)", 0
+            f"Not enough M15 candles (need >= {max(3, IMPULSE_LOOKBACK)})", 0
         )
 
     last_idx = m15.index[-1]
@@ -310,7 +311,6 @@ def compute_breakout_for_last_bar(
         )
 
     atr_now = float(atr1h_a.loc[last_idx])
-    atr_prev = float(atr1h_a.shift(1).loc[last_idx]) if not pd.isna(atr1h_a.shift(1).loc[last_idx]) else atr_now
     atr_pips = pips_diff(instrument, atr_now)
 
     last_open = float(m15["open"].loc[last_idx])
@@ -320,19 +320,41 @@ def compute_breakout_for_last_bar(
 
     body = abs(last_close - last_open)
 
-    # Filters based on your charts
+    # 1) Volatility floor – still require "enough" ATR on 1H
     if atr_pips < MIN_ATR_PIPS:
         return MesSignal(
             instrument, "NONE", last_close, 0.0, 0.0, atr_pips, 0.0, 0.0,
             f"ATR too low ({atr_pips:.1f} pips)", 0
         )
 
-    if atr_now <= atr_prev:
+    # 2) NEW: 3-bar impulse + acceleration filter (Option A + D)
+    recent = m15.iloc[-IMPULSE_LOOKBACK:]
+    first_open = float(recent["open"].iloc[0])
+    last_close_imp = float(recent["close"].iloc[-1])
+
+    up_seq = bool((recent["close"] > recent["open"]).all())
+    down_seq = bool((recent["close"] < recent["open"]).all())
+
+    move_pips = pips_diff(instrument, last_close_imp - first_open)
+
+    ranges = recent["high"] - recent["low"]
+    avg_range = float(ranges.mean())
+    avg_range_pips = pips_diff(instrument, avg_range)
+
+    impulse_ok = move_pips >= IMPULSE_MIN_PIPS
+    accel_ok = avg_range_pips >= IMPULSE_MIN_AVG_RANGE_ATR_FACTOR * atr_pips
+
+    if not ((up_seq or down_seq) and impulse_ok and accel_ok):
+        reason = (
+            f"No 3-bar impulse: dir_ok={up_seq or down_seq}, "
+            f"move={move_pips:.1f}p, avg_range={avg_range_pips:.1f}p"
+        )
         return MesSignal(
             instrument, "NONE", last_close, 0.0, 0.0, atr_pips, 0.0, 0.0,
-            "ATR not expanding on H1", 0
+            reason, 0
         )
 
+    # 3) Keep breakout body filter so last bar isn't tiny
     body_ok = body >= BREAKOUT_BODY_ATR_FACTOR * atr_now
     if not body_ok:
         return MesSignal(
@@ -355,7 +377,7 @@ def compute_breakout_for_last_bar(
     short_signal = trend_down_now and break_down
 
     if not long_signal and not short_signal:
-        reason = "No MES v3.0 breakout (structure/trend mismatch)"
+        reason = "No MES v3.1 breakout (structure/trend mismatch)"
         return MesSignal(
             instrument, "NONE", last_close, 0.0, 0.0, atr_pips, 0.0, 0.0,
             reason, 0
@@ -384,7 +406,7 @@ def compute_breakout_for_last_bar(
     else:
         tp = price_from_pips(instrument, entry, tp_pips, "down")
 
-    # Unit sizing based on risk distance
+    # Unit sizing based on risk distance (will be overwritten in build_mes_signal using NAV)
     pip_value = 0.01 if "JPY" in instrument else 0.0001
     risk_amount = get_nav() * (RISK_PERCENT / 100.0)
     per_unit_risk = risk_pips * pip_value
@@ -393,7 +415,7 @@ def compute_breakout_for_last_bar(
     units = max(units_raw, units_min)
     units_clamped = int(min(MAX_UNITS_CLAMP, max(1000, units)))
 
-    reason = f"MES v3.0 Breakout {side.title()}"
+    reason = f"MES v3.1 Breakout {side.title()} (impulse)"
 
     return MesSignal(
         instrument,
@@ -414,7 +436,7 @@ def compute_breakout_for_last_bar(
 
 def build_mes_signal(instrument: str, account_nav: float) -> MesSignal:
     """
-    Live engine: pulls latest M15/H1/H4, applies v3.0 breakout logic.
+    Live engine: pulls latest M15/H1/H4, applies v3.1 breakout logic.
     """
     h1 = get_candles(instrument, "H1", count=500)
     h4 = get_candles(instrument, "H4", count=500)
@@ -447,12 +469,11 @@ def build_mes_signal(instrument: str, account_nav: float) -> MesSignal:
     # Use provided account_nav for unit sizing instead of recalculating inside helper
     if sig.side in ("BUY", "SELL") and sig.units > 0:
         pip_value = 0.01 if "JPY" in instrument else 0.0001
-        # recompute units using provided nav
-        risk_amount = account_nav * (RISK_PERCENT / 100.0)
         if sig.side == "BUY":
             risk_pips = pips_diff(instrument, sig.entry_price - sig.sl_price)
         else:
             risk_pips = pips_diff(instrument, sig.sl_price - sig.entry_price)
+        risk_amount = account_nav * (RISK_PERCENT / 100.0)
         per_unit_risk = risk_pips * pip_value
         units_raw = risk_amount / per_unit_risk if per_unit_risk > 0 else 0
         units_min = MIN_DOLLAR_PER_PIP / pip_value
@@ -463,7 +484,7 @@ def build_mes_signal(instrument: str, account_nav: float) -> MesSignal:
     return sig
 
 # ─────────────────────────────────────────────────────────────
-# BACKTEST ENGINE – MES v3.0 BREAKOUT
+# BACKTEST ENGINE – MES v3.1 BREAKOUT
 # ─────────────────────────────────────────────────────────────
 
 @dataclass
@@ -491,14 +512,14 @@ def run_backtest(days: int = BACKTEST_DEFAULT_DAYS, pair: Optional[str] = None) 
 
     inst_list = [pair] if pair else INSTRUMENTS
 
-    print(f"[MES v3.0 BACKTEST] Starting backtest for {days} days...")
-    print(f"[MES v3.0 BACKTEST] Time window: {start} → {end}")
-    print(f"[MES v3.0 BACKTEST] Instruments: {', '.join(inst_list)}")
+    print(f"[MES v3.1 BACKTEST] Starting backtest for {days} days...")
+    print(f"[MES v3.1 BACKTEST] Time window: {start} → {end}")
+    print(f"[MES v3.1 BACKTEST] Instruments: {', '.join(inst_list)}")
 
     all_trades: List[BacktestTrade] = []
 
     for instrument in inst_list:
-        print(f"[MES v3.0 BACKTEST] Fetching history for {instrument}...")
+        print(f"[MES v3.1 BACKTEST] Fetching history for {instrument}...")
 
         # Rough counts: enough to cover days + buffer
         m15 = get_candles(instrument, "M15", count=days * 96 + 500)
@@ -518,12 +539,11 @@ def run_backtest(days: int = BACKTEST_DEFAULT_DAYS, pair: Optional[str] = None) 
         h4 = h4[(h4.index <= end)]
 
         if m15.empty or h1.empty or h4.empty:
-            print(f"[MES v3.0 BACKTEST] Not enough data for {instrument}, skipping.")
+            print(f"[MES v3.1 BACKTEST] Not enough data for {instrument}, skipping.")
             continue
 
         atr1h = calc_atr(h1, 14)
         atr1h_a = atr1h.reindex(m15.index, method="ffill")
-        atr1h_a_prev = atr1h_a.shift(1)
 
         # EMA200 trend filter
         h1["ema200"] = ema(h1["close"], 200)
@@ -555,7 +575,6 @@ def run_backtest(days: int = BACKTEST_DEFAULT_DAYS, pair: Optional[str] = None) 
             price_low = float(m15["low"].loc[ts])
 
             atr_now = float(atr1h_a.loc[ts])
-            atr_prev = float(atr1h_a_prev.loc[ts]) if not pd.isna(atr1h_a_prev.loc[ts]) else atr_now
             atr_pips = pips_diff(instrument, atr_now)
 
             # Manage existing position first
@@ -604,13 +623,34 @@ def run_backtest(days: int = BACKTEST_DEFAULT_DAYS, pair: Optional[str] = None) 
                 pos_side = ""
                 continue
 
-            # No position → look for MES v3.0 breakout entry
-            if i < 3:
-                continue  # need at least 3 candles for prior swing
+            # No position → look for MES v3.1 breakout entry
+            if i < max(3, IMPULSE_LOOKBACK - 1):
+                continue  # need enough candles for swings + impulse
 
             if atr_pips < MIN_ATR_PIPS:
                 continue
-            if atr_now <= atr_prev:
+
+            # Impulse + acceleration filter on last IMPULSE_LOOKBACK bars (including this one)
+            start_idx = i - IMPULSE_LOOKBACK + 1
+            if start_idx < 0:
+                continue
+            recent = m15.iloc[start_idx : i + 1]
+
+            recent_open0 = float(recent["open"].iloc[0])
+            recent_close_last = float(recent["close"].iloc[-1])
+
+            up_seq = bool((recent["close"] > recent["open"]).all())
+            down_seq = bool((recent["close"] < recent["open"]).all())
+
+            move_pips = pips_diff(instrument, recent_close_last - recent_open0)
+            ranges = recent["high"] - recent["low"]
+            avg_range = float(ranges.mean())
+            avg_range_pips = pips_diff(instrument, avg_range)
+
+            impulse_ok = move_pips >= IMPULSE_MIN_PIPS
+            accel_ok = avg_range_pips >= IMPULSE_MIN_AVG_RANGE_ATR_FACTOR * atr_pips
+
+            if not ((up_seq or down_seq) and impulse_ok and accel_ok):
                 continue
 
             trend_up_now = bool(trend_up.loc[ts])
@@ -682,7 +722,7 @@ def run_backtest(days: int = BACKTEST_DEFAULT_DAYS, pair: Optional[str] = None) 
             )
 
     if not all_trades:
-        print("[MES v3.0 BACKTEST] No trades generated.")
+        print("[MES v3.1 BACKTEST] No trades generated.")
         return
 
     df = pd.DataFrame([t.__dict__ for t in all_trades])
@@ -698,14 +738,14 @@ def run_backtest(days: int = BACKTEST_DEFAULT_DAYS, pair: Optional[str] = None) 
     sum_pips = df["pips"].sum()
 
     print("────────────────────────────────────────────")
-    print(f"[MES v3.0 BACKTEST] Trades: {total_trades}")
-    print(f"[MES v3.0 BACKTEST] Wins : {wins}")
-    print(f"[MES v3.0 BACKTEST] Loss : {losses}")
-    print(f"[MES v3.0 BACKTEST] Timeouts: {timeouts}")
-    print(f"[MES v3.0 BACKTEST] Win rate: {win_rate:.1f}%")
-    print(f"[MES v3.0 BACKTEST] Avg R:R : {avg_rr:.2f}")
-    print(f"[MES v3.0 BACKTEST] Avg pips: {avg_pips:.1f}")
-    print(f"[MES v3.0 BACKTEST] Total pips: {sum_pips:.1f}")
+    print(f"[MES v3.1 BACKTEST] Trades: {total_trades}")
+    print(f"[MES v3.1 BACKTEST] Wins : {wins}")
+    print(f"[MES v3.1 BACKTEST] Loss : {losses}")
+    print(f"[MES v3.1 BACKTEST] Timeouts: {timeouts}")
+    print(f"[MES v3.1 BACKTEST] Win rate: {win_rate:.1f}%")
+    print(f"[MES v3.1 BACKTEST] Avg R:R : {avg_rr:.2f}")
+    print(f"[MES v3.1 BACKTEST] Avg pips: {avg_pips:.1f}")
+    print(f"[MES v3.1 BACKTEST] Total pips: {sum_pips:.1f}")
     print("By instrument:")
     print(df.groupby("instrument")["pips"].agg(["count", "sum", "mean"]))
 
@@ -717,13 +757,13 @@ def cmd_auto(args) -> None:
     now_ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
 
     if not OANDA_API_KEY or not OANDA_ACCOUNT_ID:
-        msg = f"[MES v3.0 AUTO] {now_ts} | OANDA_API_KEY or OANDA_ACCOUNT_ID missing."
+        msg = f"[MES v3.1 AUTO] {now_ts} | OANDA_API_KEY or OANDA_ACCOUNT_ID missing."
         print(msg)
         send_telegram(msg)
         return
 
     if not trading_window_open():
-        msg = f"[MES v3.0 AUTO] {now_ts} | Trading window CLOSED – skipping."
+        msg = f"[MES v3.1 AUTO] {now_ts} | Trading window CLOSED – skipping."
         print(msg)
         send_telegram(msg)
         return
@@ -731,7 +771,7 @@ def cmd_auto(args) -> None:
     try:
         nav = get_nav()
     except Exception as e:
-        msg = f"[MES v3.0 AUTO] {now_ts} | NAV error: {e}"
+        msg = f"[MES v3.1 AUTO] {now_ts} | NAV error: {e}"
         print(msg)
         send_telegram(msg)
         return
@@ -739,13 +779,13 @@ def cmd_auto(args) -> None:
     try:
         open_trades = get_open_trade_count()
     except Exception as e:
-        msg = f"[MES v3.0 AUTO] {now_ts} | Open trades error: {e}"
+        msg = f"[MES v3.1 AUTO] {now_ts} | Open trades error: {e}"
         print(msg)
         send_telegram(msg)
         return
 
     if open_trades >= MAX_OPEN_TRADES:
-        msg = f"[MES v3.0 AUTO] {now_ts} | Max trades open ({open_trades}) – no new trades."
+        msg = f"[MES v3.1 AUTO] {now_ts} | Max trades open ({open_trades}) – no new trades."
         print(msg)
         send_telegram(msg)
         return
@@ -756,7 +796,7 @@ def cmd_auto(args) -> None:
             sig = build_mes_signal(inst, nav)
             signals.append(sig)
         except Exception as e:
-            print(f"[MES v3.0 AUTO] ERROR {inst} | {e}")
+            print(f"[MES v3.1 AUTO] ERROR {inst} | {e}")
 
     actionable = [s for s in signals if s.side in ("BUY", "SELL") and s.units > 0]
     slots_left = max(0, MAX_OPEN_TRADES - open_trades)
@@ -768,16 +808,16 @@ def cmd_auto(args) -> None:
                                 sig.sl_price, sig.tp_price, sig.units)
         trades_sent.append((sig, result))
         print(
-            f"[MES v3.0 AUTO] TRADE {sig.instrument} {sig.side} "
+            f"[MES v3.1 AUTO] TRADE {sig.instrument} {sig.side} "
             f"units={sig.units} ATR={sig.atr_pips:.1f} TP={sig.tp_pips:.1f} | {result}"
         )
 
     for sig in signals:
         if sig not in [t[0] for t in trades_sent]:
-            print(f"[MES v3.0 AUTO] SKIP {sig.instrument} | {sig.reason}")
+            print(f"[MES v3.1 AUTO] SKIP {sig.instrument} | {sig.reason}")
 
     lines = [
-        f"*MES v3.0 AUTO {now_ts}*",
+        f"*MES v3.1 AUTO {now_ts}*",
         f"Account NAV: `{nav:.2f}`",
         f"Open trades before run: {open_trades}",
     ]
@@ -802,14 +842,14 @@ def main():
         sys.exit(1)
 
     parser = argparse.ArgumentParser(
-        description="MES v3.0 – Pure Breakout / Continuation – Auto-Trader + Backtester (OANDA CLI)"
+        description="MES v3.1 – Impulse Breakout / Continuation – Auto-Trader + Backtester (OANDA CLI)"
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_auto = sub.add_parser("auto", help="Run one MES v3.0 auto cycle")
+    p_auto = sub.add_parser("auto", help="Run one MES v3.1 auto cycle")
     p_auto.set_defaults(func=cmd_auto)
 
-    p_bt = sub.add_parser("backtest", help="Run MES v3.0 breakout backtest")
+    p_bt = sub.add_parser("backtest", help="Run MES v3.1 breakout backtest")
     p_bt.add_argument("--days", type=int, default=BACKTEST_DEFAULT_DAYS)
     p_bt.add_argument("--pair", type=str, default=None)
 

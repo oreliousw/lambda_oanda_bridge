@@ -94,6 +94,22 @@ def build_order(inst, units, sl, tp):
 def lambda_handler(event, context):
     """MES-only webhook handler"""
     try:
+        # Detect GET /ping for health checks
+        http_method = event.get("httpMethod") or event.get("requestContext", {}).get("http", {}).get("method", "")
+        path = event.get("path") or event.get("requestContext", {}).get("http", {}).get("path", "")
+
+        if http_method == "GET" and path.endswith("/ping"):
+            return {
+                "statusCode": 200,
+                "body": json.dumps({
+                    "status": "ok",
+                    "version": __version__,
+                    "env": OANDA_ENV,
+                    "account": OANDA_ACCOUNT_ID
+                })
+            }
+
+        # From this point forward, all requests MUST be POST with MES JSON
         body = event.get("body", "{}")
         data = json.loads(body) if isinstance(body, str) else body
 
@@ -107,11 +123,10 @@ def lambda_handler(event, context):
         if side not in ("BUY", "SELL") or not inst or qty <= 0:
             return {"statusCode": 400, "body": json.dumps({"error": "Invalid MES payload"})}
 
-        # Flip negative qty for SELL
         units = qty if side == "BUY" else -qty
 
-        order_body = build_order(inst, units, sl, tp)
-        code, resp = http_post(URL_ORDER, order_body)
+        payload = build_order(inst, units, sl, tp)
+        code, resp = http_post(URL_ORDER, payload)
 
         ok = code == 201
         if not ok:
